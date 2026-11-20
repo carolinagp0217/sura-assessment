@@ -4,4 +4,4 @@
 
 | # | Assumption | Why I needed it | Part(s) affected |
 |---|---|---|---|
-| 1 | | | |
+| 1 | Salesforce is called through the API Manager, not point to point| | |
