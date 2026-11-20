@@ -218,7 +218,7 @@ The same schema is used twice: the intake publishes it to the queue **without** 
 
 ## 5. Idempotency and ordering strategy
 
-### Idempotency keys (FR4)
+### Idempotency keys
 
 Two keys with different jobs:
 
@@ -236,3 +236,50 @@ The intake does **not** deduplicate: it stays stateless and answers `200` to dup
 2. **Ledger unique key** `notification.event_id` (`INSERT … ON CONFLICT DO NOTHING`). A duplicate returns zero rows and the message completes with no effect. This is the real guarantee.
 3. **Salesforce upsert by external ID** `Payment_Key__c` plus the ordering rule below: re-applying the same event is a no-op because an equal event does not beat itself.
    This also neutralizes Austral replays: it signs no timestamp, so an old captured request can be replayed with a valid signature. The same `eventId` is rejected by layers 2 and 3, and an old event can never beat a newer state.
+
+## 6. Error-handling strategy
+
+| Where | Failure | Retry? | How and for how long | Outcome |
+|---|---|---|---|---|
+| Intake | Invalid signature / stale timestamp | No | — | `401`, nothing stored, counter `payments.intake.rejected{reason=signature}` |
+| Intake | Authentic but unparseable | No | — | `400` and alert. The provider keeps the event; a mapping fix inside the provider retry window (Andina 24 h, Austral 48 h, Quetzal 3 days) lets the retry succeed |
+| Intake | Broker unavailable | By the provider | Fail fast: publish timeout 1.5 s, answer `503` well inside Andina's 5 s limit | Provider retries per its policy |
+| Consumer | PostgreSQL unavailable | Yes | Consumer **pauses** (breaker) instead of abandoning messages, so delivery counts are not burned by infrastructure failures; resumes with backoff 1 s → 60 s; alert after 5 min | Messages wait in the queue (TTL 14 days) |
+| Consumer | Deterministic failure (invalid schema, unmappable value) | No (2 deliveries) | — | Dead-letter with reason; notification `DEAD_LETTERED`; alert |
+| Flusher | Salesforce `5xx`, timeout | Yes | Backoff 2 s doubling to 60 s with circuit breaker; half-open probe of one call; alert after 15 min | Rows stay pending, backlog drains after recovery |
+| Flusher | `403 REQUEST_LIMIT_EXCEEDED` | After recovery | Breaker open at least 15 min, doubling to 60 min; **page immediately** (affects every integration) | Rows stay pending |
+| Flusher | `401` | Once | Refresh token, retry once; a second `401` is a configuration alert | — |
+| Flusher | Per record `UNABLE_TO_LOCK_ROW` | Yes | Per-row backoff 5 s doubling to 5 min, up to 10 attempts | then `FAILED` |
+| Flusher | Per record `INVALID_FIELD` (policy not found) | Yes, limited | Backoff 1 min → 1 h for up to 24 h (the policy may be created after the payment) | then `FAILED` (parked) |
+| Flusher | Per record other `400` (validation) | No | — | `FAILED` with the Salesforce error code |
+| Flusher | Salesforce confirms but the ledger update fails | Yes | Rows stay pending and are sent again; the upsert is idempotent, so the repeat is harmless | — |
+| Publisher | Topic unavailable | Yes | Backoff 1 s → 60 s; alert if the oldest unpublished event is older than 15 min | Rows stay `PENDING`, Finance and Notifications wait; nothing is lost |
+
+**Circuit breaker scope.** The providers call us; we never call them, so there is no breaker towards providers. Breakers protect the calls **we** make: Salesforce, the topic, and PostgreSQL on the consumer side.
+
+## 7. Capacity
+
+### Salesforce API budget
+| Strategy | Calls on a peak day | % of 150,000 |
+|---|---|---|
+| One call per notification, no lookups | 120,000 | **80%** |
+| One call per notification plus one lookup each | 240,000 | 160% (over budget) |
+| **This design**: batches of ≤ 200 records, one call at most every 10 s (or when 200 rows are due) | **≤ 8,640** (86,400 s ÷ 10) plus retries | **≤ 5.8%** |
+
+* Unique events at peak: 120,000 × 0.97 = 116,400; if every flush were full that would be 582 calls. The 10 s wait is a deliberate trade: up to 10 s of extra delay for staying under 6% of budget.
+* Internal **budget guard**: per-minute call counts in `sf_api_usage`; soft cap **100,000 calls per rolling 24 h** (67% of the allocation, leaving room for the org-wide shared limit); alert at 50%. Token requests are counted and the token is cached (~2 h).
+* Outage probes: with the breaker open, one probe call per 30–60 s adds at most about 2,880 calls/day.
+* Publishing to Finance and Notifications uses Service Bus, not Salesforce, so it spends no API budget.
+### Burst of 40/s for 15 minutes
+
+* 36,000 notifications. Per-record writes with 25 concurrent requests would give about 83/s at p50 (0.3 s) but only **about 21/s at p95 (1.2 s) and about 3/s at 8 s**, so the burst would pile up and the 25-request limit would be the bottleneck.
+* Batched: 36,000 ÷ 200 = **180 calls** over the 15 minutes. Capacity with 5 concurrent calls of 200 records at 4 s each is **250 records/s**, about six times the burst rate.
+* Intake needs only an HMAC and a broker publish per request; 2 replicas hold 40 requests/s with wide margin; autoscale to 6 on concurrent requests.
+
+## 8. Data persisted outside Salesforce
+
+Persisted: a **PostgreSQL database** ( *ledger*). It is needed because Salesforce cannot do conditional updates, cannot tell us a notification was seen and cannot be the operations search store without spending API budget. Nothing else is stored: no raw webhook bodies, no payer data.
+
+Schema are four tables. `payment_state` and `notification` are the core: one `payment_state` row per payment, and one `notification` row per notification received for it (pending, captured, refunded, or a duplicate that was discarded). The relation is logical, through `payment_key`; it is not enforced with a foreign key because both rows are written in the same transaction. `sf_api_usage` and `ops_audit` are support tables.
+ 
+   
