@@ -30,7 +30,7 @@ Tick every item before you send your repository URL. Missing items are scored as
 
 ## Part D — Operations
 - [ ] `docs/operations/OPERATIONS.md`
-- [ ] `docs/operations/INC-0412-RESPONSE.md`
+- [ ] `reference/incident/INC-0412-RESPONSE.md`
 
 ## Part E — Code review
 - [ ] `pr-review/REVIEW.md`
