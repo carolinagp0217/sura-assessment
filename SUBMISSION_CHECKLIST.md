@@ -29,7 +29,7 @@ Tick every item before you send your repository URL. Missing items are scored as
 - [ ] Pipeline definition in `.github/workflows/` or `pipelines/`
 
 ## Part D — Operations
-- [ ] `docs/operations/OPERATIONS.md`
+- [x] `docs/operations/OPERATIONS.md`
 - [x] `reference/incident/INC-0412-RESPONSE.md`
 
 ## Part E — Code review
@@ -37,4 +37,4 @@ Tick every item before you send your repository URL. Missing items are scored as
 
 ## Part F — Responsible AI
 - [x] `AI_USAGE.md`
-- [ ] `docs/ai/AI_GUIDELINES.md`
+- [x] `docs/ai/AI_GUIDELINES.md`
